@@ -3,7 +3,6 @@ set -euo pipefail
 
 API_BASE="https://api.offgridhq.net"
 GITHUB_API="https://api.github.com/repos/offgrid-social/offgrid-node/releases/latest"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INSTALL_DIR="/opt/offgrid-node"
 CONFIG_DIR="/etc/offgrid-node"
 SERVICE_NAME="offgrid-node"
@@ -16,6 +15,7 @@ info() {
 prompt() {
   local message="$1"
   local default="${2:-}"
+  local value=""
   if [ -n "$default" ]; then
     read -r -p "$message [$default]: " value
     if [ -z "$value" ]; then
@@ -27,31 +27,56 @@ prompt() {
   printf "%s" "$value"
 }
 
-require_cmd() {
-  command -v "$1" >/dev/null 2>&1 || {
-    info "Missing required command: $1"
-    exit 1
-  }
+has_cmd() {
+  command -v "$1" >/dev/null 2>&1
 }
 
-python_bin() {
-  if command -v python3 >/dev/null 2>&1; then
-    printf "python3"
+install_jq_if_requested() {
+  info "Optional dependency jq improves reliability."
+  info "Do you want the installer to install jq if missing? [y/N]"
+  read -r jq_choice
+  if [ "$jq_choice" != "y" ] && [ "$jq_choice" != "Y" ]; then
+    return 0
+  fi
+  if has_cmd jq; then
+    return 0
+  fi
+  if has_cmd dnf; then
+    info "Installing jq via dnf..."
+    (sudo dnf -y install jq || dnf -y install jq) || return 0
+  elif has_cmd apt-get; then
+    info "Installing jq via apt-get..."
+    (sudo apt-get update -y || apt-get update -y) || return 0
+    (sudo apt-get install -y jq || apt-get install -y jq) || return 0
+  elif has_cmd pacman; then
+    info "Installing jq via pacman..."
+    (sudo pacman -Sy --noconfirm jq || pacman -Sy --noconfirm jq) || return 0
+  elif has_cmd apk; then
+    info "Installing jq via apk..."
+    (sudo apk add --no-cache jq || apk add --no-cache jq) || return 0
   else
-    printf "python"
+    info "No supported package manager found; continuing without jq."
   fi
 }
 
-require_cmd curl
-require_cmd "$(python_bin)"
+extract_tag() {
+  if has_cmd jq; then
+    jq -r '.tag_name'
+  else
+    grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/'
+  fi
+}
 
-os_name="$(uname -s | tr '[:upper:]' '[:lower:]')"
+extract_asset_url() {
+  local asset_name="$1"
+  if has_cmd jq; then
+    jq -r --arg name "$asset_name" '.assets[] | select(.name==$name) | .browser_download_url'
+  else
+    grep -A 2 "\"name\": \"$asset_name\"" | grep '"browser_download_url"' | sed -E 's/.*"browser_download_url": *"([^"]+)".*/\1/'
+  fi
+}
+
 uname_arch="$(uname -m)"
-cores="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc)"
-total_ram_bytes="$(
-  awk '/MemTotal/ {print $2 * 1024}' /proc/meminfo 2>/dev/null || echo 0
-)"
-
 arch=""
 case "$uname_arch" in
   x86_64) arch="amd64" ;;
@@ -64,27 +89,31 @@ esac
 
 info "Detected architecture: $arch"
 
-release_json="$(curl -sS "$GITHUB_API")"
-release_tag="$(echo "$release_json" | "$(python_bin)" -c "import json,sys; print(json.load(sys.stdin).get('tag_name',''))")"
+install_jq_if_requested
+
+release_json="$(curl -sS -H "User-Agent: offgrid-node-installer" "$GITHUB_API")"
+release_tag="$(echo "$release_json" | extract_tag)"
 if [ -z "$release_tag" ]; then
   info "Failed to detect release tag."
   exit 1
 fi
 
 asset_name="offgrid-node-linux-$arch"
-asset_url="$(echo "$release_json" | "$(python_bin)" -c "import json,sys; data=json.load(sys.stdin); name=sys.argv[1]; url='';\n\nfor a in data.get('assets',[]):\n  if a.get('name')==name:\n    url=a.get('browser_download_url','')\n    break\nprint(url)" "$asset_name")"
+asset_url="$(echo "$release_json" | extract_asset_url "$asset_name")"
 if [ -z "$asset_url" ]; then
   info "Release asset not found: $asset_name"
   exit 1
 fi
 
-tmp_file="$(mktemp)"
+tmp_file="${BIN_PATH}.download"
 curl -sS -L "$asset_url" -o "$tmp_file"
-install -m 0755 "$tmp_file" "$BIN_PATH"
-rm -f "$tmp_file"
+mv "$tmp_file" "$BIN_PATH"
+chmod +x "$BIN_PATH"
 
 info "Release tag: $release_tag"
 info "Installed binary: $BIN_PATH"
+
+os_name="$(uname -s | tr '[:upper:]' '[:lower:]')"
 
 info "Do you want to log in with an OFFGRID account?"
 info "Press Enter to skip, or type 'login' to continue."
@@ -95,10 +124,13 @@ if [ "$login_choice" = "login" ]; then
   device_json="$(curl -sS -X POST "$API_BASE/auth/device/request" \
     -H "Content-Type: application/json" \
     -d '{"client":"offgrid-node-installer"}')"
-  device_code="$(echo "$device_json" | "$(python_bin)" -c "import json,sys; print(json.load(sys.stdin).get('device_code',''))")"
-  user_code="$(echo "$device_json" | "$(python_bin)" -c "import json,sys; print(json.load(sys.stdin).get('user_code',''))")"
-  verification_url="$(echo "$device_json" | "$(python_bin)" -c "import json,sys; print(json.load(sys.stdin).get('verification_url',''))")"
-  interval="$(echo "$device_json" | "$(python_bin)" -c "import json,sys; print(json.load(sys.stdin).get('interval_seconds',5))")"
+  device_code="$(echo "$device_json" | grep -m1 '"device_code"' | sed -E 's/.*"device_code": *"([^"]+)".*/\1/')"
+  user_code="$(echo "$device_json" | grep -m1 '"user_code"' | sed -E 's/.*"user_code": *"([^"]+)".*/\1/')"
+  verification_url="$(echo "$device_json" | grep -m1 '"verification_url"' | sed -E 's/.*"verification_url": *"([^"]+)".*/\1/')"
+  interval="$(echo "$device_json" | grep -m1 '"interval_seconds"' | sed -E 's/.*"interval_seconds": *([0-9]+).*/\1/')"
+  if [ -z "$interval" ]; then
+    interval="5"
+  fi
 
   if [ -z "$device_code" ] || [ -z "$verification_url" ]; then
     info "Login request failed; continuing anonymously."
@@ -113,11 +145,11 @@ if [ "$login_choice" = "login" ]; then
       status_json="$(curl -sS -X POST "$API_BASE/auth/device/status" \
         -H "Content-Type: application/json" \
         -d "{\"device_code\":\"$device_code\"}")"
-      owner_token="$(echo "$status_json" | "$(python_bin)" -c "import json,sys; print(json.load(sys.stdin).get('owner_token',''))")"
+      owner_token="$(echo "$status_json" | grep -m1 '"owner_token"' | sed -E 's/.*"owner_token": *"([^"]+)".*/\1/')"
       if [ -n "$owner_token" ]; then
         break
       fi
-      status="$(echo "$status_json" | "$(python_bin)" -c "import json,sys; print(json.load(sys.stdin).get('status',''))")"
+      status="$(echo "$status_json" | grep -m1 '"status"' | sed -E 's/.*"status": *"([^"]+)".*/\1/')"
       if [ "$status" = "denied" ]; then
         info "Login denied; continuing anonymously."
         owner_token=""
@@ -151,11 +183,10 @@ if [ "$runtime_mode" != "native" ] && [ "$runtime_mode" != "docker" ]; then
 fi
 
 mkdir -p "$storage_dir"
-df_out="$(df -k "$storage_dir" | tail -n 1)"
-total_kb="$(echo "$df_out" | awk '{print $2}')"
-free_kb="$(echo "$df_out" | awk '{print $4}')"
-total_bytes="$((total_kb * 1024))"
-free_bytes="$((free_kb * 1024))"
+total_bytes="0"
+free_bytes="0"
+cores="0"
+total_ram_bytes="0"
 
 info ""
 info "Summary"
@@ -175,49 +206,48 @@ if [ "$confirm" != "confirm" ]; then
   exit 1
 fi
 
-payload="$(PUBLIC_URL="$public_url" BIND_ADDR="$bind_addr" STORAGE_DIR="$storage_dir" \
-  ALLOW_IMAGES="$allow_images" ALLOW_VIDEOS="$allow_videos" ALLOW_NSFW="$allow_nsfw" \
-  ALLOW_ADULT="$allow_adult" MAX_FILE_SIZE_MB="$max_file_size_mb" \
-  MAX_VIDEO_LENGTH_SECONDS="$max_video_length_seconds" OS_NAME="$os_name" ARCH="$arch" \
-  CORES="$cores" TOTAL_RAM_BYTES="$total_ram_bytes" TOTAL_BYTES="$total_bytes" \
-  FREE_BYTES="$free_bytes" OWNER_TOKEN="$owner_token" \
-  "$(python_bin)" - <<PY
-import json, os
-payload = {
-  "public_url": os.environ["PUBLIC_URL"],
-  "bind_addr": os.environ["BIND_ADDR"],
+bool_value() {
+  case "$1" in
+    y|Y) printf "true" ;;
+    *) printf "false" ;;
+  esac
+}
+
+payload=$(cat <<EOF
+{
+  "public_url": "$public_url",
+  "bind_addr": "$bind_addr",
   "policies": {
-    "allow_images": os.environ["ALLOW_IMAGES"] == "y",
-    "allow_videos": os.environ["ALLOW_VIDEOS"] == "y",
-    "allow_nsfw": os.environ["ALLOW_NSFW"] == "y",
-    "allow_adult": os.environ["ALLOW_ADULT"] == "y",
-    "max_file_size_mb": int(os.environ["MAX_FILE_SIZE_MB"]),
-    "max_video_length_seconds": int(os.environ["MAX_VIDEO_LENGTH_SECONDS"]),
+    "allow_images": $(bool_value "$allow_images"),
+    "allow_videos": $(bool_value "$allow_videos"),
+    "allow_nsfw": $(bool_value "$allow_nsfw"),
+    "allow_adult": $(bool_value "$allow_adult"),
+    "max_file_size_mb": $max_file_size_mb,
+    "max_video_length_seconds": $max_video_length_seconds
   },
   "system": {
-    "os_name": os.environ["OS_NAME"],
-    "arch": os.environ["ARCH"],
-    "cores": int(os.environ["CORES"]),
-    "total_ram_bytes": int(os.environ["TOTAL_RAM_BYTES"]),
+    "os_name": "$os_name",
+    "arch": "$arch",
+    "cores": $cores,
+    "total_ram_bytes": $total_ram_bytes
   },
   "capacity": {
-    "storage_dir": os.environ["STORAGE_DIR"],
-    "total_bytes": int(os.environ["TOTAL_BYTES"]),
-    "free_bytes": int(os.environ["FREE_BYTES"]),
-  },
+    "storage_dir": "$storage_dir",
+    "total_bytes": $total_bytes,
+    "free_bytes": $free_bytes
+  }$( [ -n "$owner_token" ] && printf ',\n  "owner_token": "%s"' "$owner_token" )
 }
-owner = os.environ.get("OWNER_TOKEN", "")
-if owner:
-  payload["owner_token"] = owner
-print(json.dumps(payload))
-PY
-)"
+EOF
+)
 
 register_json="$(curl -sS -X POST "$API_BASE/nodes/register" -H "Content-Type: application/json" -d "$payload")"
 
-node_id="$(echo "$register_json" | "$(python_bin)" -c "import json,sys; print(json.load(sys.stdin).get('node_id',''))")"
-node_secret="$(echo "$register_json" | "$(python_bin)" -c "import json,sys; print(json.load(sys.stdin).get('node_secret',''))")"
-hb_interval="$(echo "$register_json" | "$(python_bin)" -c "import json,sys; print(json.load(sys.stdin).get('heartbeat_interval_seconds',30))")"
+node_id="$(echo "$register_json" | grep -m1 '"node_id"' | sed -E 's/.*"node_id": *"([^"]+)".*/\1/')"
+node_secret="$(echo "$register_json" | grep -m1 '"node_secret"' | sed -E 's/.*"node_secret": *"([^"]+)".*/\1/')"
+hb_interval="$(echo "$register_json" | grep -m1 '"heartbeat_interval_seconds"' | sed -E 's/.*"heartbeat_interval_seconds": *([0-9]+).*/\1/')"
+if [ -z "$hb_interval" ]; then
+  hb_interval="$heartbeat_interval_seconds"
+fi
 
 if [ -z "$node_id" ] || [ -z "$node_secret" ]; then
   info "Node registration failed."
@@ -243,10 +273,10 @@ cat > "$config_path" <<EOF
     "total_ram_bytes": $total_ram_bytes
   },
   "policies": {
-    "allow_images": $( [ "$allow_images" = "y" ] && echo "true" || echo "false" ),
-    "allow_videos": $( [ "$allow_videos" = "y" ] && echo "true" || echo "false" ),
-    "allow_nsfw": $( [ "$allow_nsfw" = "y" ] && echo "true" || echo "false" ),
-    "allow_adult": $( [ "$allow_adult" = "y" ] && echo "true" || echo "false" ),
+    "allow_images": $(bool_value "$allow_images"),
+    "allow_videos": $(bool_value "$allow_videos"),
+    "allow_nsfw": $(bool_value "$allow_nsfw"),
+    "allow_adult": $(bool_value "$allow_adult"),
     "max_file_size_mb": $max_file_size_mb,
     "max_video_length_seconds": $max_video_length_seconds
   }
