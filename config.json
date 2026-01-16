@@ -1,0 +1,22 @@
+{
+  "node_id": "00000000-0000-0000-0000-000000000000",
+  "node_secret": "replace-with-node-secret",
+  "public_url": "https://node.example.org",
+  "bind_addr": "0.0.0.0:8787",
+  "storage_dir": "/var/lib/offgrid-node/media",
+  "heartbeat_interval_seconds": 30,
+  "system": {
+    "os_name": "linux",
+    "arch": "amd64",
+    "cores": 4,
+    "total_ram_bytes": 17179869184
+  },
+  "policies": {
+    "allow_images": true,
+    "allow_videos": true,
+    "allow_nsfw": false,
+    "allow_adult": false,
+    "max_file_size_mb": 50,
+    "max_video_length_seconds": 300
+  }
+}

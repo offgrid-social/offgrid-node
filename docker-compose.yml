@@ -1,0 +1,10 @@
+services:
+  offgrid-node:
+    build: .
+    container_name: offgrid-node
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./data:/data
