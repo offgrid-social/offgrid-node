@@ -1,7 +1,6 @@
 //go:build windows && service
 // +build windows,service
 
-
 package main
 
 import (
@@ -50,7 +49,7 @@ var (
 	serviceLogger    *Logger
 )
 
-func RunAsWindowsService(name string, run func(ctx context.Context) error, logger *Logger) (bool, error) {
+func RunAsWindowsService(name string, run func(ctx context.Context) error, logger *Logger) {
 	serviceNameUTF16, _ = syscall.UTF16PtrFromString(name)
 	serviceRun = run
 	serviceLogger = logger
@@ -67,11 +66,13 @@ func RunAsWindowsService(name string, run func(ctx context.Context) error, logge
 	ret, _, err := startDispatcher.Call(uintptr(unsafe.Pointer(&table[0])))
 	if ret == 0 {
 		if errno, ok := err.(syscall.Errno); ok && errno == errorFailedServiceConnect {
-			return false, nil
+			return
 		}
-		return false, fmt.Errorf("StartServiceCtrlDispatcherW: %v", err)
+		if serviceLogger != nil {
+			serviceLogger.Error("service_dispatcher_failed", map[string]any{"error": fmt.Sprintf("StartServiceCtrlDispatcherW: %v", err)})
+		}
+		return
 	}
-	return true, nil
 }
 
 func serviceMain(argc uint32, argv **uint16) {

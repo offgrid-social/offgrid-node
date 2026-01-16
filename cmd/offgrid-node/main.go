@@ -31,14 +31,9 @@ func main() {
 	logger := NewLogger(os.Stdout)
 
 	if runtime.GOOS == "windows" && serviceMode {
-		ran, err := RunAsWindowsService("OFFGRIDNode", func(ctx context.Context) error {
+		RunAsWindowsService("OFFGRIDNode", func(ctx context.Context) error {
 			return runNode(ctx, *cfgPath, logger)
 		}, logger)
-		if err != nil {
-			logger.Error("service_start_failed", map[string]any{"error": err.Error()})
-			os.Exit(1)
-		}
-		_ = ran
 		return
 	}
 
