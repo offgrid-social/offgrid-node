@@ -1,8 +1,10 @@
 $ErrorActionPreference = "Stop"
 
 $ApiBase = "https://api.offgridhq.net"
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$GitHubApi = "https://api.github.com/repos/offgrid-social/offgrid-node/releases/latest"
 $InstallDir = "C:\ProgramData\offgrid-node"
+$BinaryDir = "C:\Program Files\OffgridNode"
+$BinaryPath = Join-Path $BinaryDir "offgrid-node.exe"
 $ServiceName = "OFFGRIDNode"
 
 function Prompt-Value {
@@ -22,10 +24,34 @@ function Get-YesNo {
   return $false
 }
 
+if (-not [Environment]::Is64BitOperatingSystem) {
+  Write-Host "Unsupported architecture: 64-bit Windows is required."
+  exit 1
+}
+
 $osName = (Get-CimInstance Win32_OperatingSystem).Caption
-$arch = $env:PROCESSOR_ARCHITECTURE
+$arch = "amd64"
 $cores = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
 $totalRamBytes = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
+
+$release = Invoke-RestMethod -Uri $GitHubApi -Method Get
+$tag = $release.tag_name
+if (-not $tag) {
+  Write-Host "Failed to detect release tag."
+  exit 1
+}
+
+$asset = $release.assets | Where-Object { $_.name -eq "offgrid-node.exe" } | Select-Object -First 1
+if (-not $asset.browser_download_url) {
+  Write-Host "Release asset not found: offgrid-node.exe"
+  exit 1
+}
+
+New-Item -ItemType Directory -Force -Path $BinaryDir | Out-Null
+Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $BinaryPath
+
+Write-Host "Release tag: $tag"
+Write-Host "Installed binary: $BinaryPath"
 
 Write-Host "Do you want to log in with an OFFGRID account?"
 Write-Host "Press Enter to skip, or type 'login' to continue."
@@ -78,6 +104,10 @@ $heartbeatIntervalSeconds = [int](Prompt-Value "Heartbeat interval (seconds)" "3
 $runtimeMode = Prompt-Value "Runtime mode (native/docker)" "native"
 if ($runtimeMode -ne "native" -and $runtimeMode -ne "docker") {
   Write-Host "Invalid runtime mode."
+  exit 1
+}
+if ($runtimeMode -eq "docker") {
+  Write-Host "Docker mode is not supported by this installer on Windows."
   exit 1
 }
 
@@ -166,33 +196,8 @@ $config = @{
 }
 $config | ConvertTo-Json | Set-Content -Path $configPath -Encoding UTF8
 
-if ($runtimeMode -eq "native") {
-  if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
-    Write-Host "Go is required for native mode."
-    exit 1
-  }
-  Push-Location $ScriptDir
-  go build -o "$InstallDir\offgrid-node.exe" .\cmd\offgrid-node
-  Pop-Location
-
-  sc.exe create $ServiceName binPath= "`"$InstallDir\offgrid-node.exe`" --config `"$configPath`"" start= auto DisplayName= "OFFGRID Node" | Out-Null
-  sc.exe start $ServiceName | Out-Null
-} else {
-  if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-    Write-Host "Docker is required for docker mode."
-    exit 1
-  }
-  New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir "data") | Out-Null
-  Copy-Item -Path (Join-Path $ScriptDir "docker-compose.yml") -Destination (Join-Path $InstallDir "docker-compose.yml") -Force
-  Copy-Item -Path $configPath -Destination (Join-Path $InstallDir "config.json") -Force
-  Push-Location $InstallDir
-  if (Get-Command docker-compose -ErrorAction SilentlyContinue) {
-    docker-compose up -d --build
-  } else {
-    docker compose up -d --build
-  }
-  Pop-Location
-}
+sc.exe create $ServiceName binPath= "`"$BinaryPath`" --config `"$configPath`"" start= auto DisplayName= "OFFGRID Node" | Out-Null
+sc.exe start $ServiceName | Out-Null
 
 Write-Host "Waiting for node to become healthy..."
 for ($i = 0; $i -lt 30; $i++) {

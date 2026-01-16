@@ -2,10 +2,12 @@
 set -euo pipefail
 
 API_BASE="https://api.offgridhq.net"
+GITHUB_API="https://api.github.com/repos/offgrid-social/offgrid-node/releases/latest"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INSTALL_DIR="/opt/offgrid-node"
 CONFIG_DIR="/etc/offgrid-node"
 SERVICE_NAME="offgrid-node"
+BIN_PATH="/usr/local/bin/offgrid-node"
 
 info() {
   printf "%s\n" "$1"
@@ -42,14 +44,47 @@ python_bin() {
 
 require_cmd curl
 require_cmd "$(python_bin)"
-require_cmd go
 
 os_name="$(uname -s | tr '[:upper:]' '[:lower:]')"
-arch="$(uname -m)"
+uname_arch="$(uname -m)"
 cores="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc)"
 total_ram_bytes="$(
   awk '/MemTotal/ {print $2 * 1024}' /proc/meminfo 2>/dev/null || echo 0
 )"
+
+arch=""
+case "$uname_arch" in
+  x86_64) arch="amd64" ;;
+  aarch64|arm64) arch="arm64" ;;
+  *)
+    info "Unsupported architecture: $uname_arch"
+    exit 1
+    ;;
+esac
+
+info "Detected architecture: $arch"
+
+release_json="$(curl -sS "$GITHUB_API")"
+release_tag="$(echo "$release_json" | "$(python_bin)" -c "import json,sys; print(json.load(sys.stdin).get('tag_name',''))")"
+if [ -z "$release_tag" ]; then
+  info "Failed to detect release tag."
+  exit 1
+fi
+
+asset_name="offgrid-node-linux-$arch"
+asset_url="$(echo "$release_json" | "$(python_bin)" -c "import json,sys; data=json.load(sys.stdin); name=sys.argv[1]; url='';\n\nfor a in data.get('assets',[]):\n  if a.get('name')==name:\n    url=a.get('browser_download_url','')\n    break\nprint(url)" "$asset_name")"
+if [ -z "$asset_url" ]; then
+  info "Release asset not found: $asset_name"
+  exit 1
+fi
+
+tmp_file="$(mktemp)"
+curl -sS -L "$asset_url" -o "$tmp_file"
+install -m 0755 "$tmp_file" "$BIN_PATH"
+rm -f "$tmp_file"
+
+info "Release tag: $release_tag"
+info "Installed binary: $BIN_PATH"
 
 info "Do you want to log in with an OFFGRID account?"
 info "Press Enter to skip, or type 'login' to continue."
@@ -221,7 +256,6 @@ EOF
 chmod 600 "$config_path"
 
 if [ "$runtime_mode" = "native" ]; then
-  (cd "$SCRIPT_DIR" && go build -o "$INSTALL_DIR/offgrid-node" ./cmd/offgrid-node)
   cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
 Description=OFFGRID Node
@@ -229,7 +263,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=$INSTALL_DIR/offgrid-node --config $config_path
+ExecStart=$BIN_PATH --config $config_path
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
@@ -246,13 +280,25 @@ else
     info "Docker is required for docker mode."
     exit 1
   fi
-  mkdir -p "$INSTALL_DIR/data"
-  cp "$config_path" "$INSTALL_DIR/config.json"
-  cp "$SCRIPT_DIR/docker-compose.yml" "$INSTALL_DIR/docker-compose.yml"
+  mkdir -p "$INSTALL_DIR"
+  cat > "$INSTALL_DIR/docker-compose.yml" <<EOF
+services:
+  offgrid-node:
+    image: alpine:3.20
+    container_name: offgrid-node
+    restart: unless-stopped
+    command: ["/app/offgrid-node", "--config", "/app/config.json"]
+    ports:
+      - "8787:8787"
+    volumes:
+      - "$BIN_PATH:/app/offgrid-node:ro"
+      - "$config_path:/app/config.json:ro"
+      - "$storage_dir:$storage_dir"
+EOF
   if command -v docker-compose >/dev/null 2>&1; then
-    (cd "$INSTALL_DIR" && docker-compose up -d --build)
+    (cd "$INSTALL_DIR" && docker-compose up -d)
   else
-    (cd "$INSTALL_DIR" && docker compose up -d --build)
+    (cd "$INSTALL_DIR" && docker compose up -d)
   fi
 fi
 
